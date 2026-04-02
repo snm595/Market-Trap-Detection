@@ -18,6 +18,11 @@ from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
 # Add project root to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -863,6 +868,20 @@ if data_mode != "simulated" and crossed_above_70 and curr_data is not None:
 # Single two-column layout to avoid Streamlit column interleaving artifacts.
 main_col, side_col = st.columns([0.7, 0.3])
 
+with main_col:
+    st.markdown(
+        '<div style="color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 0.5rem; font-family: \'JetBrains Mono\'">REAL-TIME TAPE</div>',
+        unsafe_allow_html=True,
+    )
+    create_advanced_chart(merged_1m)
+    render_terminal_log()
+    st.markdown("### TRAP HISTORY (LAST 10)")
+    if st.session_state.trap_history:
+        history_df = pd.DataFrame(list(st.session_state.trap_history))
+        st.dataframe(history_df, use_container_width=True, hide_index=True, height=240)
+    else:
+        st.info("No trap events have crossed above 70% yet.")
+
 with side_col:
     risk_score = smoothed_risk
 
@@ -895,7 +914,8 @@ with side_col:
     )
 
     render_control_indicator(snapshot["buyer_seller_control"])
-    reasons_to_show = snapshot["reasons"] if risk_score >= 40 else []
+    # Keep reasons visible for operator context, even in low-risk states.
+    reasons_to_show = snapshot["reasons"] if snapshot.get("reasons") else []
     render_reasons_panel(reasons_to_show, risk_score)
     render_component_attribution(snapshot.get("components", {}))
 
@@ -904,21 +924,10 @@ with side_col:
     else:
         st.info("Awaiting price for depth...")
 
-with main_col:
-    st.markdown(
-        '<div style="color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 0.5rem; font-family: \'JetBrains Mono\'">REAL-TIME TAPE</div>',
-        unsafe_allow_html=True,
-    )
-    create_advanced_chart(merged_1m)
-    render_terminal_log()
-
-st.markdown("### TRAP HISTORY (LAST 10)")
-if st.session_state.trap_history:
-    history_df = pd.DataFrame(list(st.session_state.trap_history))
-    st.dataframe(history_df, use_container_width=True, hide_index=True)
+# Real-time refresh loop.
+# Prefer st_autorefresh to avoid render stacking artifacts from manual sleep/rerun loops.
+if st_autorefresh is not None:
+    st_autorefresh(interval=refresh_rate * 1000, key="markettrap_live_refresh")
 else:
-    st.info("No trap events have crossed above 70% yet.")
-
-# Real-time update loop
-time.sleep(refresh_rate)
-st.rerun()
+    time.sleep(refresh_rate)
+    st.rerun()
