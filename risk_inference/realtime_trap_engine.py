@@ -45,7 +45,9 @@ def build_component_scores(df_1m: pd.DataFrame) -> Tuple[Dict[str, float], Dict[
 
     rolling_high = frame["price"].rolling(20, min_periods=5).max().shift(1)
     breakout = frame["price"] > rolling_high
-    breakout_failure = breakout.shift(1).fillna(False) & (frame["price"] < rolling_high)
+    breakout_prev = breakout.shift(1)
+    breakout_prev = breakout_prev.where(breakout_prev.notna(), False).astype(bool)
+    breakout_failure = breakout_prev & (frame["price"] < rolling_high)
 
     near_high = frame["price"] >= frame["price"].rolling(20, min_periods=5).max() * 0.995
     low_rel_volume = frame["volume"] < frame["volume"].rolling(20, min_periods=5).mean() * 0.9

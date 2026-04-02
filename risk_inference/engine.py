@@ -80,7 +80,7 @@ class MarketTrapEngine:
             except Exception as e:
                 logger.error(f"Error in ML prediction: {e}")
                 
-        anomaly_component = ml_risk_pct / 100.0
+        anomaly_component = max(0.0, min(float(ml_risk_pct) / 100.0, 1.0))
         
         # 4. Weighted Aggregation
         # Weights optimized for institutional distribution detection
@@ -101,6 +101,9 @@ class MarketTrapEngine:
         risk_level = "LOW"
         if risk_score >= 70: risk_level = "CRITICAL"
         elif risk_score >= 40: risk_level = "ELEVATED"
+
+        if risk_score < 40:
+            reasons = []
         
         return {
             "risk_score": risk_score,

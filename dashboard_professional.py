@@ -5,9 +5,11 @@ Professional real-time dashboard with Binance WebSocket integration and advanced
 
 from collections import deque
 from datetime import datetime
+import logging
 import os
 import sys
 import time
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -21,6 +23,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.binance_ws import BinanceWSClient
 from risk_inference.engine import MarketTrapEngine
+
+logger = logging.getLogger(__name__)
 
 # --- Configuration & Styling ---
 st.set_page_config(
@@ -180,6 +184,15 @@ st.markdown(
         padding: 0.8rem;
     }
 
+    .attribution-panel {
+        width: 100%;
+        margin-top: 0.7rem;
+        background: #0b1117;
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        padding: 0.7rem;
+    }
+
     @keyframes pulse {
         0% { opacity: 1; }
         50% { opacity: 0.4; }
@@ -227,6 +240,12 @@ if "risk_state" not in st.session_state:
 if "trap_history" not in st.session_state:
     st.session_state.trap_history = deque(maxlen=MAX_TRAP_EVENTS)
 
+if "sim_mode_announced" not in st.session_state:
+    st.session_state.sim_mode_announced = False
+
+if "last_risk_log_level" not in st.session_state:
+    st.session_state.last_risk_log_level = None
+
 client = st.session_state.binance_client
 engine = st.session_state.engine
 
@@ -269,7 +288,7 @@ def render_header(is_critical: bool = False):
     )
 
 
-def render_metrics(symbol: str):
+def render_metrics(symbol: str, context_df: Optional[pd.DataFrame] = None):
     df = client.get_latest_data(symbol)
     if df is not None and not df.empty:
         curr = df.iloc[-1]
@@ -306,6 +325,46 @@ def render_metrics(symbol: str):
             unsafe_allow_html=True,
         )
         return curr
+
+    # Fallback metrics from merged 1m context (historical/simulated path).
+    if context_df is not None and not context_df.empty:
+        curr = context_df.iloc[-1]
+        prev = context_df.iloc[-2] if len(context_df) > 1 else curr
+        change = float(curr["price"]) - float(prev["price"])
+        change_pct = (change / float(prev["price"]) * 100) if float(prev["price"]) != 0 else 0
+        color = "var(--bullish)" if change >= 0 else "var(--bearish)"
+        context_high = float(context_df["price"].tail(120).max())
+        context_low = float(context_df["price"].tail(120).min())
+        context_volume = float(curr["volume"])
+
+        st.markdown(
+            f"""
+        <div class="metric-container">
+            <div class="metric-card">
+                <div class="metric-label">Price ({symbol.upper()})</div>
+                <div class="metric-value">${float(curr['price']):,.2f}</div>
+                <div class="metric-delta" style="color: {color}">
+                    {"+" if change >= 0 else ""}{change:.2f} ({change_pct:+.2f}%)
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Context High (120m)</div>
+                <div class="metric-value">${context_high:,.2f}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Context Low (120m)</div>
+                <div class="metric-value">${context_low:,.2f}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Volume (1m)</div>
+                <div class="metric-value">{context_volume:,.2f}</div>
+            </div>
+        </div>
+        """,
+            unsafe_allow_html=True,
+        )
+        return curr
+
     return None
 
 
@@ -338,8 +397,8 @@ def fetch_historical_context(symbol: str, limit: int = 120):
             df["price"] = df["close"].astype(float)
             df["volume"] = df["volume"].astype(float)
             return df[["timestamp", "price", "volume"]]
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Historical context fetch failed for %s: %s", symbol, exc)
     return pd.DataFrame()
 
 
@@ -349,7 +408,10 @@ def build_merged_1m_frame(symbol: str):
     frames = []
 
     if hist_df is not None and not hist_df.empty:
-        frames.append(hist_df[["timestamp", "price", "volume"]].copy())
+        hist = hist_df[["timestamp", "price", "volume"]].copy()
+        hist["timestamp"] = hist["timestamp"].astype(int)
+        hist["source_rank"] = 0
+        frames.append(hist)
 
     if rt_df is not None and not rt_df.empty:
         rt_df = rt_df.copy()
@@ -363,17 +425,19 @@ def build_merged_1m_frame(symbol: str):
             .reset_index()
         )
         if not rt_1m.empty:
-            rt_1m["timestamp"] = rt_1m["datetime"].astype("int64") // 10**9
+            rt_1m["timestamp"] = (rt_1m["datetime"].astype("int64") // 10**9).astype(int)
             rt_1m = rt_1m.rename(columns={"volume_delta": "volume"})
-            frames.append(rt_1m[["timestamp", "price", "volume"]])
+            rt_1m["source_rank"] = 1
+            frames.append(rt_1m[["timestamp", "price", "volume", "source_rank"]])
 
     if not frames:
         return pd.DataFrame()
 
     merged = pd.concat(frames, ignore_index=True)
     merged = (
-        merged.groupby("timestamp", as_index=False)
-        .agg({"price": "last", "volume": "sum"})
+        merged.sort_values(["timestamp", "source_rank"])
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .drop(columns=["source_rank"])
         .sort_values("timestamp")
         .tail(180)
     )
@@ -508,13 +572,43 @@ def render_risk_gauge(risk_score: float):
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
-def render_order_book(curr_price: float):
-    np.random.seed(int(time.time() * 100) % 10000)
-    bids = sorted([(curr_price * (1 - 0.0001 * i), np.random.uniform(0.1, 2.5)) for i in range(1, 10)], reverse=True)
-    asks = sorted([(curr_price * (1 + 0.0001 * i), np.random.uniform(0.1, 2.5)) for i in range(1, 10)])
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_order_book_depth(symbol: str, limit: int = 10):
+    url = "https://api.binance.com/api/v3/depth"
+    try:
+        res = requests.get(url, params={"symbol": symbol.upper(), "limit": limit}, timeout=4)
+        if res.status_code != 200:
+            return None
+        payload = res.json()
+        bids = [(float(price), float(qty)) for price, qty in payload.get("bids", [])]
+        asks = [(float(price), float(qty)) for price, qty in payload.get("asks", [])]
+        if not bids or not asks:
+            return None
+        return {"bids": bids, "asks": asks}
+    except Exception as exc:
+        logger.debug("Order book fetch failed for %s: %s", symbol, exc)
+        return None
+
+
+def render_order_book(symbol: str, curr_price: float):
+    depth = fetch_order_book_depth(symbol, limit=10)
+    if depth is None:
+        st.markdown(
+            """
+            <div style="background:#0d1117; border:1px solid var(--border-color); border-radius:8px; padding:0.8rem; height:100%;">
+                <div style="color:var(--text-secondary); font-size:0.7rem; letter-spacing:1px; margin-bottom:0.5rem;">ORDER DEPTH</div>
+                <div style="font-size:0.78rem; color:var(--text-secondary);">Order book unavailable from REST endpoint.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    bids = depth["bids"][:10]
+    asks = depth["asks"][:10]
 
     html = f'<div style="background:#0d1117; border: 1px solid var(--border-color); border-radius: 8px; padding: 0.8rem; height: 100%;">'
-    html += f'<div style="color:var(--text-secondary); font-size:0.7rem; letter-spacing:1px; margin-bottom:0.5rem;">LIVE ORDER DEPTH</div>'
+    html += f'<div style="color:var(--text-secondary); font-size:0.7rem; letter-spacing:1px; margin-bottom:0.5rem;">ORDER DEPTH (REST)</div>'
     
     # Asks (Sellers)
     for p, v in reversed(asks):
@@ -575,18 +669,15 @@ def update_risk_state(symbol: str, raw_risk_score: float):
 
 
 def render_reasons_panel(reasons, risk_score):
-    header = "TOP TRAP REASONS" if risk_score >= 40 else "TOP MARKET SIGNALS"
-    st.markdown(f'<div class="reasons-panel"><div style="font-size:0.72rem;color:var(--text-secondary);margin-bottom:0.45rem;">{header}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="reasons-panel"><div style="font-size:0.72rem;color:var(--text-secondary);margin-bottom:0.45rem;">TOP TRAP REASONS</div>', unsafe_allow_html=True)
     
-    if reasons and risk_score >= 15:
+    if reasons and risk_score >= 40:
         for reason in reasons:
             conf_color = "var(--text-secondary)"
             if reason['confidence'] > 50: conf_color = "white"
             st.markdown(f"<div style='font-size:0.78rem; margin-bottom:0.28rem;'>• {reason['reason']} <span style='color:{conf_color}'>({reason['confidence']:.1f}%)</span></div>", unsafe_allow_html=True)
-    elif risk_score >= 15:
-        st.markdown("<div style='font-size:0.78rem;color:var(--text-secondary);'>Filtering high-confidence signals...</div>", unsafe_allow_html=True)
     else:
-        st.markdown("<div style='font-size:0.78rem;color:var(--text-secondary);'>Monitoring for institutional-grade trap signals...</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:0.78rem;color:var(--text-secondary);'>Awaiting elevated trap conditions...</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -605,6 +696,37 @@ def render_control_indicator(control_state: str):
         f"<div class='control-chip' style='background:{bg}; color:{fg};'>ORDERFLOW BIAS: {control_state.upper()}</div>",
         unsafe_allow_html=True,
     )
+
+
+def render_component_attribution(components: dict):
+    labels = [
+        ("Structure", components.get("structure_failure", 0.0)),
+        ("Volume", components.get("volume_behavior", 0.0)),
+        ("Momentum", components.get("momentum_exhaustion", 0.0)),
+        ("Anomaly", components.get("anomaly", 0.0)),
+    ]
+    total = sum(max(0.0, val) for _, val in labels)
+    if total <= 0:
+        total = 1.0
+
+    st.markdown(
+        '<div class="attribution-panel"><div style="font-size:0.70rem;color:var(--text-secondary);margin-bottom:0.45rem;">TRAP DNA (COMPONENT WEIGHT SHARE)</div>',
+        unsafe_allow_html=True,
+    )
+    for label, value in labels:
+        share = (max(0.0, value) / total) * 100.0
+        st.markdown(
+            f"""
+            <div style="font-size:0.72rem; display:flex; justify-content:space-between; margin-bottom:0.2rem;">
+                <span>{label}</span><span style="color:var(--text-secondary)">{share:.1f}%</span>
+            </div>
+            <div style="height:5px; border-radius:6px; background:#1f2937; margin-bottom:0.42rem;">
+                <div style="height:5px; border-radius:6px; width:{share:.1f}%; background:#58a6ff;"></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # Sidebar Settings
@@ -653,14 +775,17 @@ def _make_simulated_1m(symbol: str, periods: int = 180):
     return df
 
 
+data_mode = "live"
 if st.session_state.get('ws_restricted', False):
     st.info('Live Binance feed blocked — showing historical/simulated data instead.')
     hist = fetch_historical_context(symbol_choice, limit=180)
     if hist is None or hist.empty:
         merged_1m = _make_simulated_1m(symbol_choice, periods=180)
+        data_mode = "simulated"
     else:
         merged_1m = hist.copy()
         merged_1m['datetime'] = pd.to_datetime(merged_1m['timestamp'], unit='s')
+        data_mode = "historical"
 else:
     merged_1m = build_merged_1m_frame(symbol_choice)
     if merged_1m is None or merged_1m.empty:
@@ -668,9 +793,11 @@ else:
         hist = fetch_historical_context(symbol_choice, limit=180)
         if hist is None or hist.empty:
             merged_1m = _make_simulated_1m(symbol_choice, periods=180)
+            data_mode = "simulated"
         else:
             merged_1m = hist.copy()
             merged_1m['datetime'] = pd.to_datetime(merged_1m['timestamp'], unit='s')
+            data_mode = "historical"
 
 snapshot = engine.get_risk_snapshot(symbol_choice, merged_1m)
 snapshot["main_reason"] = snapshot["reasons"][0]["reason"] if snapshot["reasons"] else "Monitoring..."
@@ -678,23 +805,40 @@ snapshot["buyer_seller_control"] = snapshot["control"]
 
 is_critical, crossed_above_70, streak_count, smoothed_risk = update_risk_state(symbol_choice, snapshot["risk_score"])
 
-if crossed_above_70:
-    log_event(f"TRAP DETECTED: {snapshot['trap_type']} ({snapshot['risk_score']}%)", "error")
-    st.toast(f"🚨 CRITICAL TRAP: {snapshot['trap_type']}", icon="⚠️")
-elif smoothed_risk > 40:
-    log_event(f"ELEVATED RISK: {snapshot['trap_type']} ({smoothed_risk}%)", "warning")
-elif snapshot["control"] != st.session_state.last_control:
-    log_event(f"BIAS SHIFT: {snapshot['control'].upper()}", "info")
-    st.session_state.last_control = snapshot["control"]
-elif not st.session_state.last_control: # First run
-    log_event(f"INITIAL BIAS: {snapshot['control'].upper()}", "info")
-    st.session_state.last_control = snapshot["control"]
+if data_mode == "simulated":
+    # Prevent simulated snapshots from polluting real alert streak state.
+    st.session_state.risk_state[symbol_choice] = {"streak": 0, "last_smoothed_risk": 0.0, "smoothed_risk": 0.0}
+    is_critical = False
+    crossed_above_70 = False
+    streak_count = 0
+    smoothed_risk = round(snapshot["risk_score"], 1)
+    if not st.session_state.sim_mode_announced:
+        log_event("SIMULATION MODE ACTIVE: ALERTING/HISTORY SUPPRESSED", "warning")
+        st.session_state.sim_mode_announced = True
+else:
+    st.session_state.sim_mode_announced = False
+    risk_level_for_log = "CRITICAL" if smoothed_risk >= CRITICAL_THRESHOLD else ("ELEVATED" if smoothed_risk >= 40 else "NORMAL")
+
+    if crossed_above_70:
+        log_event(f"TRAP DETECTED: {snapshot['trap_type']} ({snapshot['risk_score']}%)", "error")
+        st.toast(f"🚨 CRITICAL TRAP: {snapshot['trap_type']}", icon="⚠️")
+    elif smoothed_risk > 40 and st.session_state.last_risk_log_level != "ELEVATED":
+        log_event(f"ELEVATED RISK: {snapshot['trap_type']} ({smoothed_risk}%)", "warning")
+
+    if snapshot["control"] != st.session_state.last_control:
+        log_event(f"BIAS SHIFT: {snapshot['control'].upper()}", "info")
+        st.session_state.last_control = snapshot["control"]
+    elif not st.session_state.last_control:  # First run
+        log_event(f"INITIAL BIAS: {snapshot['control'].upper()}", "info")
+        st.session_state.last_control = snapshot["control"]
+
+    st.session_state.last_risk_log_level = risk_level_for_log
 
 render_header(is_critical=is_critical)
 
-curr_data = render_metrics(symbol_choice)
+curr_data = render_metrics(symbol_choice, merged_1m)
 
-if crossed_above_70 and curr_data is not None:
+if data_mode != "simulated" and crossed_above_70 and curr_data is not None:
     st.session_state.trap_history.appendleft(
         {
             "Time (UTC)": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -743,6 +887,7 @@ with col_risk:
                 STREAK ABOVE 70%: {streak_count}/{CRITICAL_STREAK_UPDATES}
             </div>
             <div class="trap-type-badge">TRAP TYPE: {snapshot['trap_type']}</div>
+            <div style="margin-top: 8px; font-size: 0.62rem; color: var(--text-secondary);">DATA MODE: {data_mode.upper()}</div>
             <div style="margin-top: 10px; font-size: 0.6rem; color: var(--text-secondary);">SENTIMENT: {"🐂 BULLISH" if snapshot['control'] == "Buyers in Control" else "🐻 BEARISH" if snapshot['control'] == "Sellers in Control" else "⚖️ NEUTRAL"}</div>
         </div>
     """,
@@ -750,8 +895,9 @@ with col_risk:
     )
 
     render_control_indicator(snapshot["buyer_seller_control"])
-    reasons_to_show = snapshot["reasons"] # Now show reasons based on model confidence
+    reasons_to_show = snapshot["reasons"] if risk_score >= 40 else []
     render_reasons_panel(reasons_to_show, risk_score)
+    render_component_attribution(snapshot.get("components", {}))
     st.markdown("</div>", unsafe_allow_html=True)
 
 col_log, col_depth = st.columns([0.7, 0.3])
@@ -759,7 +905,7 @@ with col_log:
     render_terminal_log()
 with col_depth:
     if curr_data is not None:
-        render_order_book(curr_data["price"])
+        render_order_book(symbol_choice, curr_data["price"])
     else:
         st.info("Awaiting price for depth...")
 
