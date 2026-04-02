@@ -1,0 +1,63 @@
+{
+  "api": {
+    "binance_api_key": "",
+    "binance_secret_key": "",
+    "rate_limit_per_minute": 1200,
+    "timeout_seconds": 30
+  },
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "markettrap",
+    "username": "postgres",
+    "password": "",
+    "ssl_mode": "prefer"
+  },
+  "websocket": {
+    "binance_ws_url": "wss://stream.binance.com:9443",
+    "max_reconnect_attempts": 5,
+    "reconnect_delay_seconds": 5,
+    "heartbeat_interval": 30
+  },
+  "model": {
+    "contamination": 0.1,
+    "n_estimators": 100,
+    "max_samples": "auto",
+    "random_state": 42,
+    "retrain_interval_hours": 24,
+    "feature_columns": [
+      "price_return",
+      "volume_change",
+      "volatility",
+      "breakout_strength",
+      "is_breakout",
+      "pv_divergence"
+    ]
+  },
+  "alerts": {
+    "high_risk_threshold": 80.0,
+    "price_spike_threshold": 5.0,
+    "volume_anomaly_multiplier": 3.0,
+    "email_enabled": false,
+    "slack_enabled": false,
+    "discord_enabled": false
+  },
+  "dashboard": {
+    "default_symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT"
+    ],
+    "refresh_interval_seconds": 2,
+    "max_chart_points": 100,
+    "theme": "dark",
+    "port": 8502
+  },
+  "logging": {
+    "level": "INFO",
+    "file_path": "logs/markettrap.log",
+    "max_file_size_mb": 10,
+    "backup_count": 5,
+    "console_output": true
+  }
+}
